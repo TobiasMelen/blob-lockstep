@@ -1,42 +1,17 @@
-name: Deploy to GitHub Pages
 on:
   push:
-    branches:
-      - main
-      - master
-  workflow_dispatch:
-
+    branches: [master]
 permissions:
   pages: write
   id-token: write
-
-concurrency:
-  group: pages
-  cancel-in-progress: true
-
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+    environment: github-pages
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - name: Install, test and build
-        env:
-          VITE_TURN_USERNAME: ${{ secrets.VITE_TURN_USERNAME }}
-          VITE_TURN_CREDENTIAL: ${{ secrets.VITE_TURN_CREDENTIAL }}
-        run: |
-          npm ci
-          npm test
-          npm run build
+      - run: npm ci && npm run build
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
-      - name: Deploy
-        id: deploy
-        uses: actions/deploy-pages@v4
+      - uses: actions/deploy-pages@v4

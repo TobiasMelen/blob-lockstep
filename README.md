@@ -77,9 +77,9 @@ rollbacks, stalls and the result of the periodic state-hash comparison.
 
 ## Deploy
 
-`.github/workflows/pages.yml` tests, builds and deploys `dist/` to GitHub Pages when you push to
-`main` or `master`. Enable Pages with "GitHub Actions" as the source. To use TURN, add the
-optional `VITE_TURN_*` repository secrets.
+`.github/workflows/pages.yml` builds and deploys `dist/` to GitHub Pages on every push to
+`master`. Pages must use "GitHub Actions" as its source. It doesn't run the tests or pass TURN
+credentials; add `npm test` or `VITE_TURN_*` env vars to the build step if you need them.
 
 ## Limitations
 
