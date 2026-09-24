@@ -24,7 +24,7 @@ const CONDITIONS: LinkConditions = {
   loss: Math.min(0.9, Math.max(0, Number(params.get("loss")) || 0)),
 };
 /** How long a would-be host waits for ppng.io to report that the room already has one. */
-const TAKEN_GRACE_MS = 1000;
+const TAKEN_GRACE_MS = 1500;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const stage = $("stage");
@@ -86,27 +86,26 @@ type LocalGame = {
   sim: Sim;
   player: number;
   tick: number;
-  /** False while we don't know yet whether we'll join someone else's game. */
-  controlled: boolean;
   acc: number;
   /** Our input for the last simulated tick, carried into a session when a guest joins. */
   last: Input;
 };
 type NetGame = { kind: "net"; session: RollbackSession; pacer: TickPacer; link: PeerLink };
 
-let game: LocalGame | NetGame;
+/** Null until we know whether to start a game or join one already running in the room. */
+let game: LocalGame | NetGame | null = null;
 let room = "";
 let hosting: { close(): void } | null = null;
 
-function playLocal(sim: Sim, player: number, tick: number, last: Input = EMPTY_INPUT) {
-  game = { kind: "local", sim, player, tick, controlled: true, acc: 0, last };
+function playLocal(sim: Sim, player: number, tick: number) {
+  game = { kind: "local", sim, player, tick, acc: 0, last: EMPTY_INPUT };
   hud.hidden = true;
 }
 
 function stepLocal(g: LocalGame, dtMs: number) {
   g.acc += Math.min(dtMs, 250);
   while (g.acc >= TICK_MS) {
-    const input = g.controlled ? sampleInput() : EMPTY_INPUT;
+    const input = sampleInput();
     const inputs = new Array<Input>(PLAYER_COUNT).fill(EMPTY_INPUT);
     inputs[g.player] = input;
     g.sim.step(inputs);
@@ -162,7 +161,7 @@ function showInvite(text = "Waiting for a friend to open the link…") {
 /** Take the room with whatever game we have. If someone else already holds it, join them instead. */
 function becomeHost() {
   hosting = hostRoom(room, CONDITIONS, {
-    accepting: () => game.kind === "local",
+    accepting: () => game?.kind !== "net",
     onGuest: welcomeGuest,
     onTaken: () => {
       hosting = null;
@@ -174,7 +173,9 @@ function becomeHost() {
 }
 
 function welcomeGuest(link: PeerLink) {
-  const g = game;
+  // A guest can arrive while we're still checking the room; nobody else holds it, so start fresh.
+  if (!game) playLocal(Sim.create(), 0, 0);
+  const g = game!;
   if (g.kind !== "local") return link.close();
   // Restore our own snapshot too so both sides continue from identical deserialized state.
   const snapshot = g.sim.save();
@@ -202,7 +203,7 @@ async function joinGame() {
       tick: welcome.tick,
       inputs: welcome.inputs,
     });
-    if (previous.kind === "local") previous.sim.dispose();
+    if (previous?.kind === "local") previous.sim.dispose();
   } catch (err: any) {
     if (err instanceof HostSilentError) {
       // A listener was registered but nobody answered (e.g. left over from a closed tab).
@@ -210,7 +211,7 @@ async function joinGame() {
       return;
     }
     setStatus(err?.message ?? String(err), true);
-    if (!(err instanceof RoomFullError) && game.kind === "local" && game.controlled) {
+    if (!(err instanceof RoomFullError) && game?.kind === "local") {
       // We have a game of our own; stay available in case the other side comes back.
       becomeHost();
       return;
@@ -219,11 +220,11 @@ async function joinGame() {
   }
 }
 
-/** Host the room with the current local game (the idle preview if we had none). */
+/** Host the room with our current game, starting a fresh one if we have none. */
 function takeRoom() {
-  if (game.kind === "local") game.controlled = true;
+  if (!game) playLocal(Sim.create(), 0, 0);
   showInvite();
-  becomeHost();
+  if (!hosting) becomeHost();
 }
 
 // ---------------------------------------------------------------- frame loop
@@ -234,10 +235,11 @@ function frame(now: number) {
   const dt = now - last;
   last = now;
   const g = game;
-  if (g.kind === "local") {
+  if (!g) {
+    // Still looking for a friend: arena only.
+  } else if (g.kind === "local") {
     stepLocal(g, dt);
-    const cursors = g.controlled && pointer.inside ? [cursorFromInput(sampleInput(), g.player, "you")] : [];
-    renderer.draw(g.sim, cursors);
+    renderer.draw(g.sim, pointer.inside ? [cursorFromInput(sampleInput(), g.player, "you")] : []);
   } else {
     const { session, pacer } = g;
     pacer.update(session, dt, now, sampleInput);
@@ -283,7 +285,6 @@ function renderHud(session: RollbackSession) {
 async function boot() {
   setStatus("Loading physics…");
   await initPhysics();
-  game = { kind: "local", sim: Sim.create(), player: 0, tick: 0, controlled: false, acc: 0, last: EMPTY_INPUT };
   requestAnimationFrame(frame);
   if (import.meta.env.DEV) Object.assign(window, { __blob: { get game() { return game; }, renderer, pointer } });
 
@@ -296,31 +297,30 @@ async function boot() {
   window.addEventListener("hashchange", () => location.reload());
   window.addEventListener("beforeunload", () => {
     hosting?.close();
-    if (game.kind === "net") game.link.close();
+    if (game?.kind === "net") game.link.close();
   });
 
   if (params.has("solo")) {
     bar.hidden = true;
-    game.controlled = true;
+    playLocal(Sim.create(), 0, 0);
     return;
   }
 
   room = location.hash.slice(1);
   if (!room) {
+    // A brand-new room can't have anyone in it yet.
     room = randomId();
     history.replaceState(null, "", `#${room}`);
     takeRoom();
     return;
   }
 
-  // Try to take the room; ppng.io rejects a second listener at once if someone already holds it.
-  setStatus("Joining room…");
+  // Try to take the room; ppng.io rejects a second listener at once if someone already holds
+  // it, in which case onTaken switches to joining. No game runs until we know which.
+  setStatus("Looking for your friend…");
   becomeHost();
   await new Promise((resolve) => setTimeout(resolve, TAKEN_GRACE_MS));
-  if (hosting && game.kind === "local") {
-    game.controlled = true;
-    showInvite();
-  }
+  if (hosting && !game) takeRoom();
 }
 
 void boot();

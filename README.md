@@ -14,7 +14,9 @@ npm run build    # static site in dist/
 
 1. Open the site on computer A. It creates a room, puts its id in the URL (`#abc123`) and you
    can start playing right away.
-2. Send that URL to computer B. B connects, receives the current game state and joins mid-game.
+2. Send that URL to computer B. B looks for someone in the room first (no game runs meanwhile),
+   then connects, receives the current game state and joins mid-game. If the room turns out to
+   be empty, B starts a fresh game and waits there instead.
 3. Click and drag anywhere near the blob to grab it. Both players can pull at once.
 
 Whoever is in the room holds the game. If one player leaves or refreshes, the other keeps
