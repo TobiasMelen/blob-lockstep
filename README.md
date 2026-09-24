@@ -86,4 +86,10 @@ optional `VITE_TURN_*` repository secrets.
 - With no TURN configured, peers behind symmetric NATs or strict corporate firewalls can't
   connect. Same LAN or typical home networks work.
 - Exactly two players.
+- A link that goes silent for 4 s is treated as a disconnect. The game carries on and the guest
+  rejoins automatically. That also happens if a player's tab is hidden for that long, because
+  browsers pause `requestAnimationFrame` there and the simulation stops.
+- WebKit (Safari) data channels between two pages on the same Mac stop delivering after a few
+  seconds, even in a minimal test with no game code. The silence timeout turns that into a
+  short reconnect instead of a permanent stall.
 - ppng.io is a free public service with no uptime guarantee.

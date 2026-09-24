@@ -142,7 +142,7 @@ function startNet(link: PeerLink, localPlayer: number, delay: number, maxPredict
     if (game !== g) return;
     // Keep playing from where we are; whoever stays in the room carries the game on.
     playLocal(session.sim, session.localPlayer, session.tick);
-    showInvite("Your friend left. Waiting for someone to join…");
+    showInvite("Lost connection to your friend. Waiting for them to reconnect…");
     if (!hosting) becomeHost();
   });
 }

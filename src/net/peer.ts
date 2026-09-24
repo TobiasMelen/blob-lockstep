@@ -5,6 +5,7 @@ const ICE_GATHER_TIMEOUT_MS = 4000;
 const ANSWER_TIMEOUT_MS = 10000;
 const CONNECT_TIMEOUT_MS = 10000;
 const JOIN_ATTEMPTS = 3;
+const SILENCE_TIMEOUT_MS = 4000;
 
 export const RTC_CONFIG: RTCConfiguration = {
   iceCandidatePoolSize: 4,
@@ -34,6 +35,8 @@ export class PeerLink {
   private readonly listeners = new Set<(msg: any) => void>();
   private readonly closeListeners = new Set<() => void>();
   private closed = false;
+  private lastHeard = performance.now();
+  private readonly watchdog: ReturnType<typeof setInterval>;
 
   constructor(
     readonly pc: RTCPeerConnection,
@@ -42,9 +45,18 @@ export class PeerLink {
     private readonly conditions: LinkConditions,
   ) {
     const onMessage = (e: MessageEvent) => {
+      this.lastHeard = performance.now();
       const msg = JSON.parse(e.data);
       this.listeners.forEach((cb) => cb(msg));
     };
+    // A dead transport can sit in "disconnected" for 30 s+ before "failed", with channels
+    // still reporting open. Peers talk every tick, so prolonged silence means it's gone.
+    this.watchdog = setInterval(() => {
+      if (performance.now() - this.lastHeard > SILENCE_TIMEOUT_MS) {
+        console.warn(`No messages from peer for ${SILENCE_TIMEOUT_MS} ms, closing link`);
+        this.close();
+      }
+    }, 500);
     fast.onmessage = onMessage;
     reliable.onmessage = onMessage;
     const onClose = () => this.handleClose();
@@ -84,6 +96,7 @@ export class PeerLink {
   private handleClose(): void {
     if (this.closed) return;
     this.closed = true;
+    clearInterval(this.watchdog);
     this.closeListeners.forEach((cb) => cb());
   }
 }
