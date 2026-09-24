@@ -6,6 +6,8 @@ const CURVE_POINTS = RIM_COUNT * CURVE_SUBDIVISIONS;
 /** Directions in the polar radius table; a multiple of 4 so it packs into vec4 uniforms. */
 const ANGLES = 128;
 const TAU = Math.PI * 2;
+/** Steepest skin slope, |dR/dθ| / R, the shader trusts for its distance correction. */
+const MAX_LOG_SLOPE = 5;
 const RAY_COS = Float32Array.from({ length: ANGLES }, (_, k) => Math.cos((k / ANGLES) * TAU));
 const RAY_SIN = Float32Array.from({ length: ANGLES }, (_, k) => Math.sin((k / ANGLES) * TAU));
 
@@ -21,8 +23,8 @@ precision highp float;
 
 #define K ${ANGLES}
 #define P ${PLAYER_COUNT}
-const float RIM_R = ${RIM_BALL_RADIUS.toFixed(4)};
 const float TAU = 6.28318531;
+const float MAX_LOG_SLOPE = ${MAX_LOG_SLOPE.toFixed(1)};
 
 // Rim curve radius from uCenter at K evenly spaced angles from +x, CCW: the exact table,
 // then a blurred copy for shading normals so dents don't crease the whole body.
@@ -78,17 +80,22 @@ vec2 radialGradient(vec2 er, float rho, float dr) {
   return er - (dr / max(rho, 0.2)) * vec2(-er.y, er.x);
 }
 
-// Distance to the rim curve treating the blob as star-shaped around uCenter: f = rho - R(theta).
+// Distance to the skin treating the blob as star-shaped around uCenter: f = rho - R(theta).
 // Dividing by |grad f| turns the radial gap into a close approximation of the true distance.
 // Returns (distance, smoothed outward normal, smoothed R) — the smoothed parts drive shading only.
-vec4 sdBlobCurve(vec2 p) {
+vec4 sdBlob(vec2 p) {
   vec2 q = p - uCenter;
   float rho = length(q);
   vec2 er = rho > 1e-5 ? q / rho : vec2(1.0, 0.0);
   float theta = atan(q.y, q.x);
   vec2 rr = radiusAt(0, theta);
   vec2 rs = radiusAt(1, theta);
-  float d = (rho - rr.x) / length(radialGradient(er, rho, rr.y));
+  rr.y = clamp(rr.y, -MAX_LOG_SLOPE * rr.x, MAX_LOG_SLOPE * rr.x);
+  // The slope correction is a linearisation that only holds near the skin; further out it
+  // extends steep edges past their ends. There the radial gap (an upper bound) is safer.
+  float gap = rho - rr.x;
+  float corrected = gap / length(radialGradient(er, rho, rr.y));
+  float d = mix(corrected, gap, smoothstep(0.03, 0.15, abs(gap)));
   return vec4(d, normalize(radialGradient(er, rho, rs.y)), rs.x);
 }
 
@@ -104,10 +111,15 @@ float glowAlpha(float d) {
 const float GLOW_ONLY = 0.1;
 
 vec4 shadeBlob(vec2 p) {
-  vec4 sd = sdBlobCurve(p);
-  float d = sd.x - RIM_R;
+  vec4 sd = sdBlob(p);
+  float d = sd.x;
+  vec2 fromCenter = p - uCenter;
+  float lc = length(fromCenter);
+  // Away from the skin the glow follows the blurred outline, so spikes and folds give a
+  // round halo instead of a streak along their ray.
+  float glowD = mix(d, lc - sd.w, smoothstep(0.0, 0.4, d));
   if (d > GLOW_ONLY) {
-    float ga = glowAlpha(d);
+    float ga = glowAlpha(glowD);
     return vec4(GLOW * ga, ga);
   }
   vec2 g = sd.yz;
@@ -115,9 +127,7 @@ vec4 shadeBlob(vec2 p) {
 
   // r: 0 at the centre, 1 at the skin, whatever the current squish. Treat the body as a
   // sphere over that parameter so the shading gradient spans the whole blob.
-  vec2 fromCenter = p - uCenter;
-  float lc = length(fromCenter);
-  float r = clamp(lc / (sd.w + RIM_R), 0.0, 1.0);
+  float r = clamp(lc / sd.w, 0.0, 1.0);
   vec2 dir = normalize(mix(fromCenter / max(lc, 1e-4), g, r * r));
   vec3 n = normalize(vec3(dir * r, sqrt(max(1.0 - r * r, 0.0)) + 0.08));
   vec3 L = normalize(vec3(-0.45, 0.6, 0.75));
@@ -132,7 +142,7 @@ vec4 shadeBlob(vec2 p) {
 
   float a = coverage(d, aa);
   vec4 body = vec4(col * a, a);
-  float glowA = glowAlpha(d) * (1.0 - a);
+  float glowA = glowAlpha(glowD) * (1.0 - a);
   vec4 result = over(body, vec4(GLOW * glowA, glowA));
 
   // Eyes ride on the core.
@@ -200,6 +210,7 @@ export class BlobGl {
   private readonly tetherColors: Float32Array;
   private readonly curve = new Float32Array(CURVE_POINTS * 2);
   private readonly radii = new Float32Array(ANGLES * 2);
+  private readonly scratch = new Float32Array(ANGLES);
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -274,6 +285,9 @@ export class BlobGl {
     const curve = catmullRomClosed(rim, this.curve);
     const center = centroid(curve);
     polarRadii(curve, center, this.radii);
+    capToPolygon(this.radii, polarRadii(rim, center, this.scratch));
+    dilateToSkin(this.radii, this.scratch);
+    this.radii.set(this.scratch);
     blurCircular(this.radii);
     gl.uniform4fv(this.u.uRadius, this.radii);
     gl.uniform2f(this.u.uCenter, center.x, center.y);
@@ -365,6 +379,38 @@ function polarRadii(pts: Float32Array, c: { x: number; y: number }, out: Float32
     if (best > 0) fallback = best;
   }
   return out;
+}
+
+/**
+ * Catmull-Rom loops outward where the rim folds tightly. A smooth arc bulges past its chord
+ * by well under this, so cap the curve's radius at the ball polygon's radius plus this.
+ */
+const CURVE_BULGE = 0.02;
+function capToPolygon(curveR: Float32Array, polyR: Float32Array): void {
+  for (let k = 0; k < ANGLES; k++) curveR[k] = Math.min(curveR[k], polyR[k] + CURVE_BULGE);
+}
+
+/**
+ * Grows the rim curve (through ball centres) out to the skin: along each ray, the farthest
+ * point of any ball-sized disk centred on a table sample. Doing this here rather than
+ * subtracting the ball radius in the shader keeps the skin exact at corners, where the
+ * shader's linearised distance would otherwise extend steep edges into spikes.
+ */
+const DILATE_SPAN = 12; // table samples; covers the ball's angular size down to R ≈ 0.27
+const DILATE_COS = Float32Array.from({ length: DILATE_SPAN * 2 + 1 }, (_, j) => Math.cos(((j - DILATE_SPAN) / ANGLES) * TAU));
+const DILATE_SIN = Float32Array.from({ length: DILATE_SPAN * 2 + 1 }, (_, j) => Math.sin(((j - DILATE_SPAN) / ANGLES) * TAU));
+function dilateToSkin(r: Float32Array, out: Float32Array): void {
+  const rr = RIM_BALL_RADIUS * RIM_BALL_RADIUS;
+  for (let k = 0; k < ANGLES; k++) {
+    let best = 0;
+    for (let j = 0; j < DILATE_COS.length; j++) {
+      const rj = r[(k + j - DILATE_SPAN + ANGLES) % ANGLES];
+      const side = rj * DILATE_SIN[j];
+      const h = rr - side * side;
+      if (h > 0) best = Math.max(best, rj * DILATE_COS[j] + Math.sqrt(h));
+    }
+    out[k] = best;
+  }
 }
 
 /** Gaussian over neighbouring angles, sigma in table samples; kernel spans ±3 sigma. */
