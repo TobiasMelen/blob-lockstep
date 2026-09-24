@@ -95,7 +95,7 @@ export class Sim {
   static create(): Sim {
     const world = new RAPIER.World({ x: 0, y: -9.81 });
     world.timestep = 1 / TICK_RATE;
-    world.numSolverIterations = 8;
+    world.numSolverIterations = 16;
 
     const ground = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
     const wall = (x: number, y: number, hw: number, hh: number) =>
