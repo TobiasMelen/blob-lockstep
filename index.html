@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Blob Lockstep</title>
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+
+    <div id="lobby" class="panel">
+      <h1>Blob Lockstep</h1>
+      <p class="sub">Two desktops, one jelly blob. Peer-to-peer over WebRTC with deterministic rollback.</p>
+      <div id="lobby-actions" class="actions">
+        <button id="retry" hidden>Try again</button>
+        <button id="create">Create room</button>
+        <button id="solo" class="secondary">Try solo</button>
+      </div>
+      <div id="share" class="share" hidden>
+        <label>Send this link to the other computer:</label>
+        <div class="row">
+          <input id="share-link" readonly />
+          <button id="copy">Copy</button>
+        </div>
+      </div>
+      <p id="status" class="status"></p>
+    </div>
+
+    <div id="hud" hidden></div>
+    <div id="toast" hidden></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
