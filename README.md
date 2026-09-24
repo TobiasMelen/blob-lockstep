@@ -54,6 +54,13 @@ rollbacks, stalls and the result of the periodic state-hash comparison.
   resimulates. It stalls rather than predicting more than `maxPrediction` ticks ahead.
 - **Time sync** (`src/net/pacer.ts`) is a fixed-timestep loop that stretches or shrinks the tick
   length based on the estimated frame advantage over the peer.
+- **Rendering** (`src/render/`) uses three stacked layers:
+  - A 2D canvas for the arena, redrawn only on resize.
+  - A WebGL2 canvas where a single fragment pass draws the blob as a signed distance field of
+    the rim polygon, rounded by the ball radius. The glow, outline, anti-aliasing and dome
+    lighting all come from the distance, and the normals are a soft-min blend of edge
+    normals. The eyes and grab tethers are also SDFs.
+  - HTML cursors and labels, moved with `translate3d` so they're compositor-only.
 - **Desync detection**: every 30 ticks, once a tick's state is final, both peers exchange an
   FNV hash of all body state and grab state. The HUD shows `in sync ✓` or `DESYNC`.
 

@@ -4,7 +4,7 @@ import { initPhysics, Sim, TICK_RATE, WORLD_H, WORLD_W } from "./sim/sim";
 import { type NetMessage, RollbackSession } from "./net/rollback";
 import { TickPacer } from "./net/pacer";
 import { hostRoom, joinRoom, type LinkConditions, type PeerLink, randomId } from "./net/peer";
-import { cursorFromInput, Renderer } from "./render";
+import { cursorFromInput, Renderer } from "./render/renderer";
 
 const params = new URLSearchParams(location.search);
 const INPUT_DELAY = clampInt(params.get("delay"), 3, 0, 15);
@@ -16,36 +16,36 @@ const CONDITIONS: LinkConditions = {
 };
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
-const canvas = $<HTMLCanvasElement>("game");
+const stage = $("stage");
 const lobby = $("lobby");
 const lobbyActions = $("lobby-actions");
 const statusEl = $("status");
 const hud = $("hud");
 const toast = $("toast");
-const renderer = new Renderer(canvas);
+const renderer = new Renderer(stage);
 
 const pointer = { x: WORLD_W / 2, y: WORLD_H / 2, down: false, inside: false };
 const eventToWorld = (e: PointerEvent) => {
-  const rect = canvas.getBoundingClientRect();
+  const rect = stage.getBoundingClientRect();
   return renderer.toWorld(e.clientX - rect.left, e.clientY - rect.top);
 };
-canvas.addEventListener("pointermove", (e) => {
+stage.addEventListener("pointermove", (e) => {
   Object.assign(pointer, eventToWorld(e), { inside: true });
 });
-canvas.addEventListener("pointerdown", (e) => {
+stage.addEventListener("pointerdown", (e) => {
   Object.assign(pointer, eventToWorld(e), { down: true, inside: true });
-  if (canvas.hasPointerCapture?.(e.pointerId) === false) {
+  if (stage.hasPointerCapture?.(e.pointerId) === false) {
     try {
-      canvas.setPointerCapture(e.pointerId);
+      stage.setPointerCapture(e.pointerId);
     } catch {
       // Synthetic or already-released pointers can't be captured.
     }
   }
 });
 const release = () => (pointer.down = false);
-canvas.addEventListener("pointerup", release);
-canvas.addEventListener("pointercancel", release);
-canvas.addEventListener("pointerleave", () => (pointer.inside = false));
+stage.addEventListener("pointerup", release);
+stage.addEventListener("pointercancel", release);
+stage.addEventListener("pointerleave", () => (pointer.inside = false));
 window.addEventListener("blur", release);
 
 function sampleInput(): Input {

@@ -6,7 +6,7 @@ export const TICK_RATE = 60;
 export const WORLD_W = 16;
 export const WORLD_H = 9;
 
-const RIM_COUNT = 28;
+export const RIM_COUNT = 28;
 /** cos/sin of 2π / RIM_COUNT. */
 const ROT_COS = 0.9749279121818236;
 const ROT_SIN = 0.2225209339563144;
