@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { EMPTY_INPUT, type Input } from "../src/sim/input";
-import { initPhysics, Sim } from "../src/sim/sim";
+import { initPhysics, Sim, type SimSnapshot } from "../src/sim/sim";
 import { type NetMessage, RollbackSession } from "../src/net/rollback";
 import { TickPacer } from "../src/net/pacer";
 import { inputScript, lcg } from "./helpers";
@@ -17,7 +17,9 @@ type Peer = {
   clockSkew: number;
 };
 
-function runMatch(link: LinkOptions, inputDelay: number, durationMs: number, seed: number) {
+type Start = { snapshot: SimSnapshot; tick: number; inputs: Input[] };
+
+function runMatch(link: LinkOptions, inputDelay: number, durationMs: number, seed: number, start?: Start) {
   const rand = lcg(seed);
   const queue: { at: number; to: number; msg: NetMessage }[] = [];
   let now = 0;
@@ -44,6 +46,7 @@ function runMatch(link: LinkOptions, inputDelay: number, durationMs: number, see
         inputDelay,
         maxPrediction: 12,
         transport: makeTransport(p),
+        resume: start && { sim: simFrom(start.snapshot), tick: start.tick, inputs: start.inputs },
         onFinalHash: (t, h) => finalHashes.set(t, h),
       }),
       pacer: new TickPacer(),
@@ -83,27 +86,35 @@ function runMatch(link: LinkOptions, inputDelay: number, durationMs: number, see
   return peers;
 }
 
-function referenceHashes(peers: Peer[], inputDelay: number, upTo: number) {
+function simFrom(snapshot: SimSnapshot) {
   const sim = Sim.create();
+  sim.load(snapshot);
+  return sim;
+}
+
+/** Replays the match on `sim` (fresh by default), starting at `start.tick`. */
+function referenceHashes(peers: Peer[], inputDelay: number, upTo: number, sim = Sim.create(), start?: Start) {
+  const from = start?.tick ?? 0;
   const hashes = new Map<number, number>();
-  for (let t = 0; t <= upTo; t++) {
+  for (let t = from; t <= upTo; t++) {
     if (t % 30 === 0) hashes.set(t, sim.hash());
     if (t === upTo) break;
     sim.step(
-      peers.map((p) => (t < inputDelay ? EMPTY_INPUT : p.scheduled.get(t)!)),
+      peers.map((p, i) => (t < from + inputDelay ? (start?.inputs[i] ?? EMPTY_INPUT) : p.scheduled.get(t)!)),
     );
   }
   sim.dispose();
   return hashes;
 }
 
-function check(peers: Peer[], inputDelay: number) {  const [a, b] = peers;
+function check(peers: Peer[], inputDelay: number, reference?: { sim: Sim; start: Start }) {
+  const [a, b] = peers;
   expect(a.session.stats.desyncTick).toBe(-1);
   expect(b.session.stats.desyncTick).toBe(-1);
   const common = [...a.finalHashes.keys()].filter((t) => b.finalHashes.has(t));
   expect(common.length).toBeGreaterThan(20);
   const last = Math.max(...common);
-  const ref = referenceHashes(peers, inputDelay, last);
+  const ref = referenceHashes(peers, inputDelay, last, reference?.sim, reference?.start);
   for (const t of common) {
     expect(a.finalHashes.get(t)).toBe(b.finalHashes.get(t));
     expect(a.finalHashes.get(t)).toBe(ref.get(t));
@@ -134,5 +145,27 @@ describe("RollbackSession", () => {
     const peers = runMatch({ latencyMs: 250, jitterMs: 150, loss: 0.3 }, 3, 15_000, 3);
     const r = check(peers, 3);
     expect(r.a.stalls + r.b.stalls).toBeGreaterThan(0);
+  });
+
+  it("guest joins mid-game from a snapshot and stays in sync", () => {
+    // Host plays alone, holding the blob when the guest arrives.
+    const live = Sim.create();
+    const script = inputScript(7);
+    let held: Input = EMPTY_INPUT;
+    for (let t = 0; t < 400; t++) {
+      if (t <= 300) held = { ...script(), down: 0 };
+      else if (t === 301) {
+        const core = live.world.getRigidBody(live.layout.core).translation();
+        held = { x: Math.round(core.x * 1000), y: Math.round(core.y * 1000) + 1000, down: 1 };
+      }
+      live.step([held, EMPTY_INPUT]);
+    }
+    expect(live.grabbedBody(0)).not.toBe(-1);
+    const start: Start = { snapshot: live.save(), tick: 400, inputs: [held, EMPTY_INPUT] };
+
+    const peers = runMatch({ latencyMs: 60, jitterMs: 30, loss: 0.1 }, 3, 12_000, 4, start);
+    // The reference continues the host's original world, which was never restored.
+    const r = check(peers, 3, { sim: live, start });
+    expect(r.a.tick).toBeGreaterThan(1000);
   });
 });

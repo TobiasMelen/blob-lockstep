@@ -2,7 +2,7 @@ import { PipingSignaling } from "./signaling";
 
 const HOST_ID = "host";
 const ICE_GATHER_TIMEOUT_MS = 4000;
-const ANSWER_TIMEOUT_MS = 20000;
+const ANSWER_TIMEOUT_MS = 10000;
 const CONNECT_TIMEOUT_MS = 10000;
 const JOIN_ATTEMPTS = 3;
 
@@ -140,40 +140,77 @@ export function randomId(length = 6): string {
 
 export type Status = (text: string) => void;
 
-/**
- * Wait for a guest to connect to `room`. A newer offer supersedes a pending attempt, so a
- * guest that retries (or reloads) mid-handshake isn't locked out. Signaling stops once
- * connected, so later visitors simply get no answer.
- */
-export function hostRoom(room: string, conditions: LinkConditions, status: Status): Promise<PeerLink> {
-  return new Promise((resolve, reject) => {
-    const signaling = new PipingSignaling(room, HOST_ID, () =>
-      reject(new Error("Lost connection to the signaling service (ppng.io)")),
-    );
-    let pending: RTCPeerConnection | undefined;
-    status("Waiting for a friend to open the link…");
+export class RoomFullError extends Error {
+  constructor() {
+    super("This room already has two players.");
+  }
+}
 
-    signaling.addListener(async ({ from, data }) => {
-      if (data?.type !== "offer" || typeof from !== "string") return;
+/** Nobody answered the offer: the room's host is gone (e.g. a stale listener from a closed tab). */
+export class HostSilentError extends Error {
+  constructor() {
+    super("The host did not answer.");
+  }
+}
+
+export type HostOptions = {
+  /** Whether a guest may connect now; otherwise offers are answered with "full". */
+  accepting: () => boolean;
+  onGuest: (link: PeerLink) => void;
+  /** Another tab already hosts this room. Signaling has stopped; join it instead. */
+  onTaken: () => void;
+  onError: (err: Error) => void;
+  status: Status;
+};
+
+/**
+ * Host `room` until closed, handing each connected guest to `onGuest`. A newer offer
+ * supersedes a pending attempt, so a guest that retries (or reloads) mid-handshake isn't
+ * locked out. Listening continues while a game runs so extra visitors learn it's full
+ * rather than mistaking the room for empty.
+ */
+export function hostRoom(room: string, conditions: LinkConditions, opts: HostOptions): { close(): void } {
+  let pending: RTCPeerConnection | undefined;
+  const signaling = new PipingSignaling(room, HOST_ID, {
+    onFailed: () => opts.onError(new Error("Lost connection to the signaling service (ppng.io)")),
+    onTaken: () => {
       pending?.close();
-      status("Friend found, connecting…");
-      const { pc, opened } = createPeer(conditions);
-      pending = pc;
-      try {
-        await pc.setRemoteDescription(data);
-        await pc.setLocalDescription(await pc.createAnswer());
-        await signaling.send(from, await gatheredDescription(pc));
-        const link = await withTimeout(opened, CONNECT_TIMEOUT_MS, "Peer connection timed out");
-        signaling.close();
-        resolve(link);
-      } catch (err) {
-        pc.close();
-        if (pending !== pc) return;
-        console.warn("Guest connection failed, waiting for another attempt", err);
-        status("Connection attempt failed, still waiting…");
-      }
-    });
+      opts.onTaken();
+    },
   });
+
+  signaling.addListener(async ({ from, data }) => {
+    if (data?.type !== "offer" || typeof from !== "string") return;
+    if (!opts.accepting()) {
+      void signaling.send(from, { type: "full" });
+      return;
+    }
+    pending?.close();
+    opts.status("Friend found, connecting…");
+    const { pc, opened } = createPeer(conditions);
+    pending = pc;
+    try {
+      await pc.setRemoteDescription(data);
+      await pc.setLocalDescription(await pc.createAnswer());
+      await signaling.send(from, await gatheredDescription(pc));
+      const link = await withTimeout(opened, CONNECT_TIMEOUT_MS, "Peer connection timed out");
+      if (pending !== pc) return link.close();
+      pending = undefined;
+      opts.onGuest(link);
+    } catch (err) {
+      pc.close();
+      if (pending !== pc) return;
+      pending = undefined;
+      console.warn("Guest connection failed, waiting for another attempt", err);
+      opts.status("Connection attempt failed, still waiting…");
+    }
+  });
+  return {
+    close() {
+      pending?.close();
+      signaling.close();
+    },
+  };
 }
 
 /** Connect to the host of `room`, retrying the whole handshake a few times. */
@@ -184,7 +221,7 @@ export async function joinRoom(room: string, conditions: LinkConditions, status:
         status(attempt > 1 ? `${text} (attempt ${attempt}/${JOIN_ATTEMPTS})` : text),
       );
     } catch (err) {
-      if (attempt >= JOIN_ATTEMPTS || (err as Error).message.startsWith("Host did not answer")) throw err;
+      if (attempt >= JOIN_ATTEMPTS || err instanceof RoomFullError || err instanceof HostSilentError) throw err;
       console.warn(`Join attempt ${attempt} failed, retrying`, err);
     }
   }
@@ -194,24 +231,25 @@ async function joinOnce(room: string, conditions: LinkConditions, status: Status
   const myId = randomId(10);
   let failSignaling: (err: Error) => void = () => {};
   const signalingFailed = new Promise<never>((_, reject) => (failSignaling = reject));
-  const signaling = new PipingSignaling(room, myId, () =>
-    failSignaling(new Error("Lost connection to the signaling service (ppng.io)")),
-  );
+  const signaling = new PipingSignaling(room, myId, {
+    onFailed: () => failSignaling(new Error("Lost connection to the signaling service (ppng.io)")),
+  });
   const { pc, opened } = createPeer(conditions);
   try {
     status("Gathering network candidates…");
     await pc.setLocalDescription(await pc.createOffer());
     const offer = await gatheredDescription(pc);
 
-    const answer = new Promise<RTCSessionDescriptionInit>((resolve) => {
+    const answer = new Promise<RTCSessionDescriptionInit>((resolve, reject) => {
       signaling.addListener(({ data }) => {
         if (data?.type === "answer") resolve(data);
+        if (data?.type === "full") reject(new RoomFullError());
       });
     });
     status("Contacting host…");
     void signaling.send(HOST_ID, offer);
     const remote = await Promise.race([
-      withTimeout(answer, ANSWER_TIMEOUT_MS, "Host did not answer. Is the room link still open on the other computer?"),
+      withTimeout(answer, ANSWER_TIMEOUT_MS, new HostSilentError()),
       signalingFailed,
     ]);
     await pc.setRemoteDescription(remote);
@@ -225,9 +263,9 @@ async function joinOnce(room: string, conditions: LinkConditions, status: Status
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, ms: number, error: string | Error): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
+    const timer = setTimeout(() => reject(typeof error === "string" ? new Error(error) : error), ms);
     promise.then(
       (v) => {
         clearTimeout(timer);

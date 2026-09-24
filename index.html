@@ -12,22 +12,16 @@
       <div class="cursors"></div>
     </div>
 
-    <div id="lobby" class="panel">
-      <h1>Blob Lockstep</h1>
-      <p class="sub">Two desktops, one jelly blob. Peer-to-peer over WebRTC with deterministic rollback.</p>
-      <div id="lobby-actions" class="actions">
-        <button id="retry" hidden>Try again</button>
-        <button id="create">Create room</button>
-        <button id="solo" class="secondary">Try solo</button>
+    <div id="bar" class="panel">
+      <div class="row">
+        <h1>Blob Lockstep</h1>
+        <p id="status" class="status"></p>
       </div>
-      <div id="share" class="share" hidden>
-        <label>Send this link to the other computer:</label>
-        <div class="row">
-          <input id="share-link" readonly />
-          <button id="copy">Copy</button>
-        </div>
+      <div id="share" class="row" hidden>
+        <input id="share-link" readonly />
+        <button id="copy">Copy link</button>
       </div>
-      <p id="status" class="status"></p>
+      <button id="retry" hidden>Try again</button>
     </div>
 
     <div id="hud" hidden></div>

@@ -12,13 +12,16 @@ npm test         # determinism, rollback-over-lossy-network and blob integrity t
 npm run build    # static site in dist/
 ```
 
-1. On computer A, click **Create room** and send the link to computer B.
-2. B opens the link. The peers connect and the simulation starts.
+1. Open the site on computer A. It creates a room, puts its id in the URL (`#abc123`) and you
+   can start playing right away.
+2. Send that URL to computer B. B connects, receives the current game state and joins mid-game.
 3. Click and drag anywhere near the blob to grab it. Both players can pull at once.
 
-Opening the room link in a second tab on the same machine works too.
+Whoever is in the room holds the game. If one player leaves or refreshes, the other keeps
+playing and takes over hosting, and the returning player rejoins their game. A third visitor is
+told the room is full. Opening the room link in a second tab on the same machine works too.
 
-**Try solo** runs the physics locally without networking.
+`?solo` runs the physics locally without networking.
 
 ### Debug URL parameters
 
@@ -37,7 +40,13 @@ rollbacks, stalls and the result of the periodic state-hash comparison.
 - **Signaling** (`src/net/signaling.ts`) is ported from acthung-webrtc. It uses the free
   [ppng.io](https://ppng.io) piping server: each peer long-polls `blob-lockstep-v1/<room>/<id>`
   and the other side POSTs to it. The ICE is non-trickle, so there's one offer and one answer.
-  After connecting, signaling is closed.
+  The host listens on `<room>/host` for as long as it's in the room. ppng.io allows one
+  receiver per path, so a newcomer first tries to listen there too: an immediate `400` means
+  someone already holds the room and it joins them, otherwise it becomes the host.
+- **Joining mid-game** (`src/net/welcome.ts`): the host sends the Rapier world snapshot, the
+  tick number and both players' inputs for the next `delay` ticks over the reliable channel,
+  then both sides start a rollback session from that tick. The host restores the same snapshot
+  on its side, so both continue from identically deserialized state.
 - **WebRTC** (`src/net/peer.ts`) uses two pre-negotiated data channels. The unordered channel has
   no retransmits and carries inputs. The reliable channel carries control messages and state
   hashes. STUN is Google's. TURN (metered.ca) is used if `VITE_TURN_USERNAME` and

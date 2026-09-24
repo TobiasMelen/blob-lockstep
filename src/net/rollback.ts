@@ -23,6 +23,8 @@ export type SessionOptions = {
   /** How many ticks past the last confirmed remote input we may simulate before stalling. */
   maxPrediction: number;
   transport: Transport;
+  /** Join an existing game: its current state, the tick it's at, and each player's input for the delay window. */
+  resume?: { sim: Sim; tick: number; inputs: readonly Input[] };
   onDesync?: (tick: number, local: number, remote: number) => void;
   /** Called with the hash of every checkpoint tick once its state is final. */
   onFinalHash?: (tick: number, hash: number) => void;
@@ -79,7 +81,7 @@ export class RollbackSession {
 
   private readonly localHashes = new Map<number, number>();
   private readonly remoteHashes = new Map<number, number>();
-  private nextHashTick = HASH_INTERVAL;
+  private nextHashTick: number;
 
   private remoteTick = 0;
   private remoteTickAt = 0;
@@ -90,7 +92,8 @@ export class RollbackSession {
   readonly stats: SessionStats;
 
   constructor(opts: SessionOptions) {
-    this.sim = Sim.create();
+    const start = opts.resume?.tick ?? 0;
+    this.sim = opts.resume?.sim ?? Sim.create();
     this.localPlayer = opts.localPlayer;
     this.remotePlayer = 1 - opts.localPlayer;
     this.inputDelay = opts.inputDelay;
@@ -99,15 +102,21 @@ export class RollbackSession {
     this.onDesync = opts.onDesync;
     this.onFinalHash = opts.onFinalHash;
 
-    // Ticks inside the initial delay window have implicit empty input for both players.
-    for (let t = 0; t < this.inputDelay; t++) {
-      this.localInputs.set(t, EMPTY_INPUT);
-      this.remoteInputs.set(t, EMPTY_INPUT);
+    // Ticks inside the initial delay window have implicit input both sides agree on.
+    const initial = opts.resume?.inputs ?? [EMPTY_INPUT, EMPTY_INPUT];
+    for (let t = start; t < start + this.inputDelay; t++) {
+      this.localInputs.set(t, initial[this.localPlayer]);
+      this.remoteInputs.set(t, initial[this.remotePlayer]);
     }
-    this.remoteConfirmed = this.inputDelay - 1;
-    this.remoteAck = this.inputDelay - 1;
+    this.currentTick = start;
+    this.frameFloor = start;
+    this.localFloor = start;
+    this.remoteTick = start;
+    this.nextHashTick = (Math.floor(start / HASH_INTERVAL) + 1) * HASH_INTERVAL;
+    this.remoteConfirmed = start + this.inputDelay - 1;
+    this.remoteAck = start + this.inputDelay - 1;
     this.stats = {
-      tick: 0,
+      tick: start,
       confirmedTick: this.remoteConfirmed,
       rollbacks: 0,
       resimulatedTicks: 0,

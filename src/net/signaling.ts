@@ -8,6 +8,12 @@ const NAMESPACE = "blob-lockstep-v1";
 
 export type SignalMessage = { from: string; data: any };
 
+export type SignalingEvents = {
+  onFailed?: () => void;
+  /** ppng.io allows one receiver per path: someone else is already listening on ours. */
+  onTaken?: () => void;
+};
+
 export class PipingSignaling {
   private readonly abort = new AbortController();
   private readonly listeners = new Set<(msg: SignalMessage) => void>();
@@ -16,7 +22,7 @@ export class PipingSignaling {
   constructor(
     private readonly room: string,
     private readonly myId: string,
-    private readonly onFailed?: () => void,
+    private readonly events: SignalingEvents = {},
   ) {
     void this.poll();
   }
@@ -57,7 +63,13 @@ export class PipingSignaling {
     const url = this.url(this.myId);
     while (!this.abort.signal.aborted) {
       try {
-        const res = await fetch(url, { signal: this.abort.signal });
+        // no-store: Chrome's HTTP cache otherwise queues a same-URL GET behind another tab's pending one.
+        const res = await fetch(url, { signal: this.abort.signal, cache: "no-store" });
+        if (res.status === 400 && this.events.onTaken) {
+          this.close();
+          this.events.onTaken();
+          return;
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         this.failures = 0;
         const text = await res.text();
@@ -72,7 +84,7 @@ export class PipingSignaling {
       } catch (err: any) {
         if (err?.name === "AbortError") return;
         if (++this.failures > 5) {
-          this.onFailed?.();
+          this.events.onFailed?.();
           return;
         }
         await sleep(1000);
