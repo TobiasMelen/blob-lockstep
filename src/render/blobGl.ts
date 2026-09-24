@@ -1,9 +1,13 @@
 import { PLAYER_COUNT, RIM_BALL_RADIUS, RIM_COUNT } from "../sim/sim";
 
-/** Catmull-Rom samples per rim link; the shader SDFs this smooth curve, not the raw polygon. */
+/** Catmull-Rom samples per rim link; the radius table is ray-cast against this smooth curve. */
 const CURVE_SUBDIVISIONS = 3;
 const CURVE_POINTS = RIM_COUNT * CURVE_SUBDIVISIONS;
-const COARSE_POINTS = RIM_COUNT / 2;
+/** Directions in the polar radius table; a multiple of 4 so it packs into vec4 uniforms. */
+const ANGLES = 128;
+const TAU = Math.PI * 2;
+const RAY_COS = Float32Array.from({ length: ANGLES }, (_, k) => Math.cos((k / ANGLES) * TAU));
+const RAY_SIN = Float32Array.from({ length: ANGLES }, (_, k) => Math.sin((k / ANGLES) * TAU));
 
 const VERTEX = /* glsl */ `#version 300 es
 void main() {
@@ -15,13 +19,15 @@ void main() {
 const FRAGMENT = /* glsl */ `#version 300 es
 precision highp float;
 
-#define N ${CURVE_POINTS}
-#define NC ${COARSE_POINTS}
+#define K ${ANGLES}
 #define P ${PLAYER_COUNT}
 const float RIM_R = ${RIM_BALL_RADIUS.toFixed(4)};
+const float TAU = 6.28318531;
 
-uniform vec2 uRim[N];
-uniform vec2 uCoarse[NC];
+// Rim curve radius from uCenter at K evenly spaced angles from +x, CCW: the exact table,
+// then a blurred copy for shading normals so dents don't crease the whole body.
+uniform vec4 uRadius[K / 2];
+uniform vec2 uCenter;
 uniform vec2 uCore;
 uniform vec2 uLook;
 uniform vec4 uBounds;      // world-space AABB of blob + glow margin
@@ -43,56 +49,50 @@ const vec3 GLOW = vec3(0.30, 0.89, 0.54);
 // Premultiplied "top over bottom".
 vec4 over(vec4 top, vec4 bottom) { return top + bottom * (1.0 - top.a); }
 
-// Width over which neighbouring segments' directions blend into the shading normal.
-const float NORMAL_SMOOTH = 0.08;
+float radiusSample(int table, int i) {
+  i = (i + K) % K + table * K;
+  return uRadius[i >> 2][i & 3];
+}
 
-// Signed distance to the rim curve polygon (Inigo Quilez's sdPolygon) plus a smooth outward normal.
-// The exact gradient jumps wherever the nearest segment changes (radial facets) and flips
-// across the polygon line itself, so the normal is a soft-min weighted blend of each
-// segment's outward edge normal. Assumes counter-clockwise rim order, as the sim builds it.
-vec3 sdPolygon(vec2 p) {
-  float d = 1e20;
-  float s = 1.0;
-  float m = 1e20;
-  vec2 acc = vec2(0.0);
-  for (int i = 0, j = N - 1; i < N; j = i, i++) {
-    vec2 e = uRim[j] - uRim[i];
-    vec2 w = p - uRim[i];
-    vec2 b = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
-    float bl = length(b);
-    d = min(d, bl);
-    vec2 dir = normalize(vec2(-e.y, e.x));
-    // Online log-sum-exp so weights never underflow.
-    if (bl < m) {
-      acc = acc * exp((bl - m) / NORMAL_SMOOTH) + dir;
-      m = bl;
-    } else {
-      acc += exp((m - bl) / NORMAL_SMOOTH) * dir;
-    }
-    bvec3 c = bvec3(p.y >= uRim[i].y, p.y < uRim[j].y, e.x * w.y > e.y * w.x);
-    if (all(c) || all(not(c))) s = -s;
-  }
-  vec2 grad = acc / max(length(acc), 1e-6);
-  return vec3(s * d, grad);
+// Rim radius R and dR/dtheta at angle theta, Catmull-Rom through the table so the slope
+// (and with it the normal) is continuous.
+vec2 radiusAt(int table, float theta) {
+  float x = theta * (float(K) / TAU);
+  float fi = floor(x);
+  float t = x - fi;
+  int i = int(fi);
+  float p0 = radiusSample(table, i - 1);
+  float p1 = radiusSample(table, i);
+  float p2 = radiusSample(table, i + 1);
+  float p3 = radiusSample(table, i + 2);
+  float b = p2 - p0;
+  float c = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
+  float d = 3.0 * p1 - p0 - 3.0 * p2 + p3;
+  float r = p1 + 0.5 * t * (b + t * (c + t * d));
+  float dr = 0.5 * (b + t * (2.0 * c + 3.0 * t * d));
+  return vec2(r, dr * (float(K) / TAU));
+}
+
+// Gradient of f = rho - R(theta) in world space.
+vec2 radialGradient(vec2 er, float rho, float dr) {
+  return er - (dr / max(rho, 0.2)) * vec2(-er.y, er.x);
+}
+
+// Distance to the rim curve treating the blob as star-shaped around uCenter: f = rho - R(theta).
+// Dividing by |grad f| turns the radial gap into a close approximation of the true distance.
+// Returns (distance, smoothed outward normal, smoothed R) — the smoothed parts drive shading only.
+vec4 sdBlobCurve(vec2 p) {
+  vec2 q = p - uCenter;
+  float rho = length(q);
+  vec2 er = rho > 1e-5 ? q / rho : vec2(1.0, 0.0);
+  float theta = atan(q.y, q.x);
+  vec2 rr = radiusAt(0, theta);
+  vec2 rs = radiusAt(1, theta);
+  float d = (rho - rr.x) / length(radialGradient(er, rho, rr.y));
+  return vec4(d, normalize(radialGradient(er, rho, rs.y)), rs.x);
 }
 
 float coverage(float d, float aa) { return 1.0 - smoothstep(-aa, aa, d); }
-
-// Signed distance to a coarse polygon (every other rim point). Its chords sit only a few cm
-// inside the fine curve, which is plenty for the glow far from the skin.
-float sdCoarse(vec2 p) {
-  float d = 1e20;
-  float s = 1.0;
-  for (int i = 0, j = NC - 1; i < NC; j = i, i++) {
-    vec2 e = uCoarse[j] - uCoarse[i];
-    vec2 w = p - uCoarse[i];
-    vec2 b = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
-    d = min(d, dot(b, b));
-    bvec3 c = bvec3(p.y >= uCoarse[i].y, p.y < uCoarse[j].y, e.x * w.y > e.y * w.x);
-    if (all(c) || all(not(c))) s = -s;
-  }
-  return s * sqrt(d);
-}
 
 // Gaussian shoulder plus a long exponential tail, like a wide blur of the silhouette.
 float glowAlpha(float d) {
@@ -100,26 +100,25 @@ float glowAlpha(float d) {
   return 0.2 * exp(-(od * od) / 0.35) + 0.08 * exp(-1.6 * od);
 }
 
-// Beyond this coarse distance outside the skin only the glow is visible.
-const float COARSE_BAND = 0.25;
+// Beyond this distance outside the skin only the glow is visible.
+const float GLOW_ONLY = 0.1;
 
 vec4 shadeBlob(vec2 p) {
-  float dc = sdCoarse(p) - RIM_R;
-  if (dc > COARSE_BAND) {
-    float ga = glowAlpha(dc);
+  vec4 sd = sdBlobCurve(p);
+  float d = sd.x - RIM_R;
+  if (d > GLOW_ONLY) {
+    float ga = glowAlpha(d);
     return vec4(GLOW * ga, ga);
   }
-  vec3 sd = sdPolygon(p);
-  float d = sd.x - RIM_R;
   vec2 g = sd.yz;
   float aa = uWorldPerPx;
 
-  // r: 0 at the core, 1 at the skin, whatever the current squish. Treat the body as a
+  // r: 0 at the centre, 1 at the skin, whatever the current squish. Treat the body as a
   // sphere over that parameter so the shading gradient spans the whole blob.
-  vec2 fromCore = p - uCore;
-  float lc = length(fromCore);
-  float r = clamp(lc / max(lc - d, 1e-4), 0.0, 1.0);
-  vec2 dir = normalize(mix(fromCore / max(lc, 1e-4), g, r * r));
+  vec2 fromCenter = p - uCenter;
+  float lc = length(fromCenter);
+  float r = clamp(lc / (sd.w + RIM_R), 0.0, 1.0);
+  vec2 dir = normalize(mix(fromCenter / max(lc, 1e-4), g, r * r));
   vec3 n = normalize(vec3(dir * r, sqrt(max(1.0 - r * r, 0.0)) + 0.08));
   vec3 L = normalize(vec3(-0.45, 0.6, 0.75));
   float diff = clamp(dot(n, L), 0.0, 1.0);
@@ -200,7 +199,7 @@ export class BlobGl {
   private u!: Record<string, WebGLUniformLocation | null>;
   private readonly tetherColors: Float32Array;
   private readonly curve = new Float32Array(CURVE_POINTS * 2);
-  private readonly coarse = new Float32Array(COARSE_POINTS * 2);
+  private readonly radii = new Float32Array(ANGLES * 2);
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -231,7 +230,7 @@ export class BlobGl {
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) ?? "link error");
     this.program = program;
     const names = [
-      "uRim", "uCoarse", "uCore", "uLook", "uBounds", "uWorldPerPx", "uWorldPerCss", "uOffset",
+      "uRadius", "uCenter", "uCore", "uLook", "uBounds", "uWorldPerPx", "uWorldPerCss", "uOffset",
       "uTether", "uTetherOn", "uTetherColor",
     ];
     this.u = Object.fromEntries(names.map((n) => [n, gl.getUniformLocation(program, n)]));
@@ -272,12 +271,12 @@ export class BlobGl {
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.useProgram(this.program);
-    gl.uniform2fv(this.u.uRim, catmullRomClosed(rim, this.curve));
-    for (let i = 0; i < COARSE_POINTS; i++) {
-      this.coarse[i * 2] = rim[i * 4];
-      this.coarse[i * 2 + 1] = rim[i * 4 + 1];
-    }
-    gl.uniform2fv(this.u.uCoarse, this.coarse);
+    const curve = catmullRomClosed(rim, this.curve);
+    const center = centroid(curve);
+    polarRadii(curve, center, this.radii);
+    blurCircular(this.radii);
+    gl.uniform4fv(this.u.uRadius, this.radii);
+    gl.uniform2f(this.u.uCenter, center.x, center.y);
     gl.uniform2f(this.u.uCore, frame.core.x, frame.core.y);
     gl.uniform2f(this.u.uLook, frame.look.x, frame.look.y);
     gl.uniform4f(this.u.uBounds, minX - m, minY - m, maxX + m, maxY + m);
@@ -318,6 +317,73 @@ function catmullRomClosed(pts: Float32Array, out: Float32Array): Float32Array {
     }
   }
   return out;
+}
+
+/** Area centroid of a closed polygon; the most star-friendly centre for a squished ring. */
+function centroid(pts: Float32Array): { x: number; y: number } {
+  const n = pts.length / 2;
+  let a = 0;
+  let cx = 0;
+  let cy = 0;
+  for (let i = 0; i < n; i++) {
+    const x0 = pts[i * 2];
+    const y0 = pts[i * 2 + 1];
+    const x1 = pts[((i + 1) % n) * 2];
+    const y1 = pts[((i + 1) % n) * 2 + 1];
+    const cross = x0 * y1 - x1 * y0;
+    a += cross;
+    cx += (x0 + x1) * cross;
+    cy += (y0 + y1) * cross;
+  }
+  return { x: cx / (3 * a), y: cy / (3 * a) };
+}
+
+/**
+ * Distance from `c` to the curve along each table direction. Where a ray crosses the curve
+ * more than once (a fold), the farthest hit wins so the silhouette never gets holes.
+ */
+function polarRadii(pts: Float32Array, c: { x: number; y: number }, out: Float32Array): Float32Array {
+  const n = pts.length / 2;
+  let fallback = 0;
+  for (let k = 0; k < ANGLES; k++) {
+    const ux = RAY_COS[k];
+    const uy = RAY_SIN[k];
+    let best = -1;
+    for (let i = 0; i < n; i++) {
+      const ax = pts[i * 2] - c.x;
+      const ay = pts[i * 2 + 1] - c.y;
+      const ex = pts[((i + 1) % n) * 2] - c.x - ax;
+      const ey = pts[((i + 1) % n) * 2 + 1] - c.y - ay;
+      const denom = ux * ey - uy * ex;
+      if (Math.abs(denom) < 1e-9) continue;
+      const s = (ax * uy - ay * ux) / denom;
+      if (s < 0 || s > 1) continue;
+      const t = (ax * ey - ay * ex) / denom;
+      if (t > best) best = t;
+    }
+    out[k] = best > 0 ? best : fallback;
+    if (best > 0) fallback = best;
+  }
+  return out;
+}
+
+/** Gaussian over neighbouring angles, sigma in table samples; kernel spans ±3 sigma. */
+const NORMAL_BLUR_SIGMA = 3;
+const BLUR_KERNEL = (() => {
+  const half = NORMAL_BLUR_SIGMA * 3;
+  const w = Array.from({ length: half * 2 + 1 }, (_, i) => Math.exp(-((i - half) ** 2) / (2 * NORMAL_BLUR_SIGMA ** 2)));
+  const sum = w.reduce((a, b) => a + b, 0);
+  return w.map((v) => v / sum);
+})();
+
+/** Fills the second half of `table` with a circular blur of the first half. */
+function blurCircular(table: Float32Array): void {
+  const half = (BLUR_KERNEL.length - 1) / 2;
+  for (let k = 0; k < ANGLES; k++) {
+    let v = 0;
+    for (let j = 0; j < BLUR_KERNEL.length; j++) v += BLUR_KERNEL[j] * table[(k + j - half + ANGLES) % ANGLES];
+    table[ANGLES + k] = v;
+  }
 }
 
 function hexToRgb(hex: string): number[] {
