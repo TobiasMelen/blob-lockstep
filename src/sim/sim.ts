@@ -14,18 +14,19 @@ const BLOB_RADIUS = 1.2;
 export const RIM_BALL_RADIUS = 0.13;
 const CORE_RADIUS = 0.35;
 export const GRAB_RADIUS = 1.0;
-// Rapier springs are acceleration-based: stiffness is (m/s²)/m regardless of mass, so
-// "heavy" comes from soft, overdamped springs: the blob lags the hand and creeps back to
-// round over ~1.5 s instead of snapping back.
-const SPOKE_STIFFNESS = 80;
-const SPOKE_DAMPING = 30;
-const BEND_STIFFNESS = 30;
-const BEND_DAMPING = 10;
-const HAND_STIFFNESS = 100;
-const HAND_DAMPING = 16;
+// Rapier springs are acceleration-based: stiffness is (m/s²)/m regardless of mass, so the
+// feel comes from stiffness vs damping. Soft, lightly damped springs make the blob stretch
+// and wobble back to round in ~0.3 s.
+const SPOKE_STIFFNESS = 120;
+const SPOKE_DAMPING = 10;
+const BEND_STIFFNESS = 40;
+const BEND_DAMPING = 3;
+const HAND_STIFFNESS = 200;
+const HAND_DAMPING = 20;
 /** The hand never leads the grabbed body by more than this, so flicks can't tear the ring. */
 const MAX_REACH = 1.4;
-const PRESSURE = 15;
+const PRESSURE = 25;
+const RIM_RESTITUTION = 0.35;
 
 const GROUP_WORLD = 0x0001;
 const GROUP_RIM = 0x0002;
@@ -154,7 +155,7 @@ export class Sim {
         RAPIER.ColliderDesc.ball(RIM_BALL_RADIUS)
           .setDensity(1.5)
           .setFriction(0.8)
-          .setRestitution(0.1)
+          .setRestitution(RIM_RESTITUTION)
           .setCollisionGroups(groups(GROUP_RIM, GROUP_WORLD | GROUP_RIM)),
         body,
       );
