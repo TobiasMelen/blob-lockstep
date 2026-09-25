@@ -67,12 +67,11 @@ rollbacks, stalls and the result of the periodic state-hash comparison.
   length based on the estimated frame advantage over the peer.
 - **Rendering** (`src/render/`) uses three stacked layers:
   - A 2D canvas for the arena, redrawn only on resize.
-  - A WebGL2 canvas where a single fragment pass draws the blob as a signed distance field.
-    Each frame the CPU ray-casts a smoothed rim curve into a table of 128 radii around the
-    blob's centroid, so per pixel the distance is a circle's `length(p) - R(angle)` with a
-    cubic lookup, corrected by the radius slope. The glow, outline, anti-aliasing and dome
-    lighting all come from that distance. Shading normals use a blurred copy of the table so
-    dents don't crease the body. The eyes and grab tethers are also SDFs.
+  - A WebGL2 canvas where the blob is a mesh the vertex shader builds from the 28 rim ball
+    positions alone (no vertex buffers): a Catmull-Rom curve pushed out by the ball radius,
+    filled as a triangle fan through a nonzero-winding stencil so folds that cross themselves
+    still fill correctly, then an outline ribbon whose soft edges do the anti-aliasing. Only
+    covered pixels are shaded. The eyes and grab tethers are instanced capsule quads.
   - HTML cursors and labels, moved with `translate3d` so they're compositor-only.
 - **Desync detection**: every 30 ticks, once a tick's state is final, both peers exchange an
   FNV hash of all body state and grab state. The HUD shows `in sync ✓` or `DESYNC`.

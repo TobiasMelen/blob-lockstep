@@ -1,134 +1,131 @@
 import { PLAYER_COUNT, RIM_BALL_RADIUS, RIM_COUNT } from "../sim/sim";
 
-/** Catmull-Rom samples per rim link; the radius table is ray-cast against this smooth curve. */
-const CURVE_SUBDIVISIONS = 3;
-const CURVE_POINTS = RIM_COUNT * CURVE_SUBDIVISIONS;
-/** Directions in the polar radius table; a multiple of 4 so it packs into vec4 uniforms. */
-const ANGLES = 128;
-const TAU = Math.PI * 2;
-/** Steepest skin slope, |dR/dθ| / R, the shader trusts for its distance correction. */
-const MAX_LOG_SLOPE = 5;
-const RAY_COS = Float32Array.from({ length: ANGLES }, (_, k) => Math.cos((k / ANGLES) * TAU));
-const RAY_SIN = Float32Array.from({ length: ANGLES }, (_, k) => Math.sin((k / ANGLES) * TAU));
+/** Catmull-Rom samples per rim link. */
+const SUBDIVISIONS = 4;
+const SKIN_POINTS = RIM_COUNT * SUBDIVISIONS;
+/** Half-width of the outline's anti-aliased edges, device px. */
+const AA_PX = 1.5;
+/** Eyes (2 whites, 2 pupils) plus a line and a dot per player's tether. */
+const MAX_SPRITES = 4 + PLAYER_COUNT * 2;
 
-const VERTEX = /* glsl */ `#version 300 es
+// The whole mesh is generated from gl_VertexID and the rim ball positions; there are no buffers.
+const BLOB_VERTEX = /* glsl */ `#version 300 es
+#define N ${RIM_COUNT}
+#define SUB ${SUBDIVISIONS}
+const float RIM_R = ${RIM_BALL_RADIUS.toFixed(4)};
+const float AA_PX = ${AA_PX.toFixed(1)};
+
+uniform vec2 uRim[N];
+uniform vec2 uCenter;
+uniform float uOrient;   // +1 if the rim runs counter-clockwise
+uniform int uPass;       // 0: body fan, 1: outline ribbon
+uniform float uOutline;  // outline width, world units
+uniform vec2 uOffset;    // world position of device pixel (0,0)
+uniform float uWorldPerPx;
+uniform vec2 uViewport;
+
+out vec2 vWorld;
+out vec2 vShade;
+out float vR;
+out float vAcross; // outline ribbon: signed distance from the skin, world units
+
+vec2 rim(int i) { return uRim[(i + N) % N]; }
+
+// Catmull-Rom position and tangent in the span starting at ball i.
+void curve(int i, float t, out vec2 p, out vec2 dp) {
+  vec2 p0 = rim(i - 1), p1 = rim(i), p2 = rim(i + 1), p3 = rim(i + 2);
+  vec2 b = p2 - p0;
+  vec2 c = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
+  vec2 d = 3.0 * p1 - p0 - 3.0 * p2 + p3;
+  p = p1 + 0.5 * t * (b + t * (c + t * d));
+  dp = 0.5 * (b + t * (2.0 * c + 3.0 * t * d));
+}
+
+vec2 outward(vec2 tangent) {
+  return vec2(tangent.y, -tangent.x) * (uOrient / max(length(tangent), 1e-6));
+}
+
+// Skin point s: the curve through the ball centres pushed out by the ball radius. The shading
+// normal comes from a chord one ball either side, so dents don't crease the dome.
+void skin(int s, out vec2 pos, out vec2 normal, out vec2 shade) {
+  int i = s / SUB;
+  float t = float(s - i * SUB) / float(SUB);
+  vec2 p, dp, a, b;
+  curve(i, t, p, dp);
+  normal = outward(dp);
+  pos = p + normal * RIM_R;
+  curve(i - 1, t, a, dp);
+  curve(i + 1, t, b, dp);
+  shade = outward(b - a);
+}
+
 void main() {
-  // Full-screen triangle, no buffers.
-  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+  vec2 world, normal, shade;
+  vAcross = 0.0;
+  if (uPass == 0) {
+    int tri = gl_VertexID / 3;
+    int corner = gl_VertexID - tri * 3;
+    if (corner == 0) {
+      world = uCenter;
+      shade = vec2(0.0);
+      vR = 0.0;
+    } else {
+      // Inset so the fill's aliased edge sits under the opaque part of the outline.
+      skin(tri + corner - 1, world, normal, shade);
+      world -= normal * AA_PX * uWorldPerPx;
+      vR = 1.0;
+    }
+  } else {
+    // Spans from inside the outline to just past the skin, so both edges get a soft fringe
+    // and the fill's hard edge stays covered.
+    skin(gl_VertexID >> 1, world, normal, shade);
+    float aa = AA_PX * uWorldPerPx;
+    vAcross = (gl_VertexID & 1) == 1 ? -uOutline - aa : aa;
+    world += normal * vAcross;
+    vR = 1.0;
+  }
+  vWorld = world;
+  vShade = shade;
+  gl_Position = vec4((world - uOffset) / (uWorldPerPx * uViewport) * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
-const FRAGMENT = /* glsl */ `#version 300 es
+const BLOB_FRAGMENT = /* glsl */ `#version 300 es
 precision highp float;
+precision highp int;
 
-#define K ${ANGLES}
-#define P ${PLAYER_COUNT}
-const float TAU = 6.28318531;
-const float MAX_LOG_SLOPE = ${MAX_LOG_SLOPE.toFixed(1)};
+const float AA_PX = ${AA_PX.toFixed(1)};
 
-// Rim curve radius from uCenter at K evenly spaced angles from +x, CCW: the exact table,
-// then a blurred copy for shading normals so dents don't crease the whole body.
-uniform vec4 uRadius[K / 2];
+uniform int uPass;
 uniform vec2 uCenter;
-uniform vec2 uCore;
-uniform vec2 uLook;
-uniform vec4 uBounds;      // world-space AABB of blob + glow margin
-uniform float uWorldPerPx; // world units per device pixel
-uniform float uWorldPerCss;
-uniform vec2 uOffset;      // world position of fragment (0,0)
-uniform vec4 uTether[P];   // hand.xy, body.xy
-uniform float uTetherOn[P];
-uniform vec3 uTetherColor[P];
-
+uniform float uOutline;
+uniform float uWorldPerPx;
+in vec2 vWorld;
+in vec2 vShade;
+in float vR;
+in float vAcross;
 out vec4 outColor;
 
 const vec3 DEEP = vec3(0.07, 0.42, 0.22);
 const vec3 BASE = vec3(0.30, 0.89, 0.54);
 const vec3 LIGHT = vec3(0.78, 1.0, 0.86);
 const vec3 OUTLINE = vec3(0.05, 0.36, 0.19);
-const vec3 GLOW = vec3(0.30, 0.89, 0.54);
 
-// Premultiplied "top over bottom".
-vec4 over(vec4 top, vec4 bottom) { return top + bottom * (1.0 - top.a); }
-
-float radiusSample(int table, int i) {
-  i = (i + K) % K + table * K;
-  return uRadius[i >> 2][i & 3];
-}
-
-// Rim radius R and dR/dtheta at angle theta, Catmull-Rom through the table so the slope
-// (and with it the normal) is continuous.
-vec2 radiusAt(int table, float theta) {
-  float x = theta * (float(K) / TAU);
-  float fi = floor(x);
-  float t = x - fi;
-  int i = int(fi);
-  float p0 = radiusSample(table, i - 1);
-  float p1 = radiusSample(table, i);
-  float p2 = radiusSample(table, i + 1);
-  float p3 = radiusSample(table, i + 2);
-  float b = p2 - p0;
-  float c = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3;
-  float d = 3.0 * p1 - p0 - 3.0 * p2 + p3;
-  float r = p1 + 0.5 * t * (b + t * (c + t * d));
-  float dr = 0.5 * (b + t * (2.0 * c + 3.0 * t * d));
-  return vec2(r, dr * (float(K) / TAU));
-}
-
-// Gradient of f = rho - R(theta) in world space.
-vec2 radialGradient(vec2 er, float rho, float dr) {
-  return er - (dr / max(rho, 0.2)) * vec2(-er.y, er.x);
-}
-
-// Distance to the skin treating the blob as star-shaped around uCenter: f = rho - R(theta).
-// Dividing by |grad f| turns the radial gap into a close approximation of the true distance.
-// Returns (distance, smoothed outward normal, smoothed R) — the smoothed parts drive shading only.
-vec4 sdBlob(vec2 p) {
-  vec2 q = p - uCenter;
-  float rho = length(q);
-  vec2 er = rho > 1e-5 ? q / rho : vec2(1.0, 0.0);
-  float theta = atan(q.y, q.x);
-  vec2 rr = radiusAt(0, theta);
-  vec2 rs = radiusAt(1, theta);
-  rr.y = clamp(rr.y, -MAX_LOG_SLOPE * rr.x, MAX_LOG_SLOPE * rr.x);
-  // The slope correction is a linearisation that only holds near the skin; further out it
-  // extends steep edges past their ends. There the radial gap (an upper bound) is safer.
-  float gap = rho - rr.x;
-  float corrected = gap / length(radialGradient(er, rho, rr.y));
-  float d = mix(corrected, gap, smoothstep(0.03, 0.15, abs(gap)));
-  return vec4(d, normalize(radialGradient(er, rho, rs.y)), rs.x);
-}
-
-float coverage(float d, float aa) { return 1.0 - smoothstep(-aa, aa, d); }
-
-// Gaussian shoulder plus a long exponential tail, like a wide blur of the silhouette.
-float glowAlpha(float d) {
-  float od = max(d, 0.0);
-  return 0.2 * exp(-(od * od) / 0.35) + 0.08 * exp(-1.6 * od);
-}
-
-// Beyond this distance outside the skin only the glow is visible.
-const float GLOW_ONLY = 0.1;
-
-vec4 shadeBlob(vec2 p) {
-  vec4 sd = sdBlob(p);
-  float d = sd.x;
-  vec2 fromCenter = p - uCenter;
-  float lc = length(fromCenter);
-  // Away from the skin the glow follows the blurred outline, so spikes and folds give a
-  // round halo instead of a streak along their ray.
-  float glowD = mix(d, lc - sd.w, smoothstep(0.0, 0.4, d));
-  if (d > GLOW_ONLY) {
-    float ga = glowAlpha(glowD);
-    return vec4(GLOW * ga, ga);
+void main() {
+  if (uPass == 1) {
+    float aa = AA_PX * uWorldPerPx;
+    float a = (1.0 - smoothstep(-aa, aa, vAcross)) * smoothstep(-uOutline - aa, -uOutline + aa, vAcross);
+    outColor = vec4(OUTLINE * a, a);
+    return;
   }
-  vec2 g = sd.yz;
-  float aa = uWorldPerPx;
-
-  // r: 0 at the centre, 1 at the skin, whatever the current squish. Treat the body as a
-  // sphere over that parameter so the shading gradient spans the whole blob.
-  float r = clamp(lc / sd.w, 0.0, 1.0);
-  vec2 dir = normalize(mix(fromCenter / max(lc, 1e-4), g, r * r));
+  // r: 0 at the centre, 1 at the skin, whatever the current squish. Treat the body as a dome
+  // over that parameter, turning from the radial direction inside to the skin normal at the edge.
+  float r = clamp(vR, 0.0, 1.0);
+  vec2 fromCenter = vWorld - uCenter;
+  float lc = length(fromCenter);
+  vec2 radial = lc > 1e-4 ? fromCenter / lc : vec2(0.0, 1.0);
+  float ls = length(vShade);
+  vec2 edge = ls > 1e-4 ? vShade / ls : radial;
+  vec2 dir = normalize(mix(radial, edge, r * r) + 1e-5);
   vec3 n = normalize(vec3(dir * r, sqrt(max(1.0 - r * r, 0.0)) + 0.08));
   vec3 L = normalize(vec3(-0.45, 0.6, 0.75));
   float diff = clamp(dot(n, L), 0.0, 1.0);
@@ -137,51 +134,59 @@ vec4 shadeBlob(vec2 p) {
   vec3 col = albedo * (0.3 + 0.8 * diff);
   col = mix(col, DEEP, smoothstep(0.6, 1.0, r) * (1.0 - diff) * 0.8);
   col += 0.28 * spec;
-  float edge = 1.0 - smoothstep(0.0, 3.0 * aa, abs(d + 0.012) - 0.012);
-  col = mix(col, OUTLINE, edge);
+  outColor = vec4(col, 1.0);
+}`;
 
-  float a = coverage(d, aa);
-  vec4 body = vec4(col * a, a);
-  float glowA = glowAlpha(glowD) * (1.0 - a);
-  vec4 result = over(body, vec4(GLOW * glowA, glowA));
+// Capsules from a to b (a == b for discs), optionally dashed; one instanced quad each.
+const SPRITE_VERTEX = /* glsl */ `#version 300 es
+#define S ${MAX_SPRITES}
+uniform vec4 uSeg[S];    // a.xy, b.xy
+uniform vec2 uStyle[S];  // radius, dash period (0 = solid)
+uniform vec3 uColor[S];
+uniform vec2 uOffset;
+uniform float uWorldPerPx;
+uniform vec2 uViewport;
 
-  // Eyes ride on the core.
-  for (int k = 0; k < 2; k++) {
-    float side = k == 0 ? -1.0 : 1.0;
-    vec2 e = uCore + vec2(side * 0.32, 0.2);
-    float white = coverage(length(p - e) - 0.18, aa);
-    float pupil = coverage(length(p - e - uLook * 0.08) - 0.09, aa);
-    result = over(vec4(vec3(white), white), result);
-    result = over(vec4(vec3(0.08, 0.09, 0.12) * pupil, pupil), result);
-  }
-  return result;
-}
-
-vec4 shadeTether(vec2 p, int i) {
-  vec2 a = uTether[i].xy;
-  vec2 b = uTether[i].zw;
-  vec2 ab = b - a;
-  float len = max(length(ab), 1e-5);
-  float h = clamp(dot(p - a, ab) / (len * len), 0.0, 1.0);
-  float d = length(p - a - ab * h);
-  float css = uWorldPerCss;
-  float dash = step(fract(h * len / (11.0 * css)), 0.55);
-  float line = coverage(d - 1.5 * css, uWorldPerPx) * dash;
-  float dot_ = coverage(length(p - b) - 5.0 * css, uWorldPerPx);
-  float alpha = max(line, dot_);
-  return vec4(uTetherColor[i] * alpha, alpha);
-}
+out vec2 vWorld;
+flat out vec4 vSeg;
+flat out vec2 vStyle;
+flat out vec3 vColor;
 
 void main() {
-  vec2 p = gl_FragCoord.xy * uWorldPerPx + uOffset;
-  vec4 col = vec4(0.0);
-  if (p.x >= uBounds.x && p.y >= uBounds.y && p.x <= uBounds.z && p.y <= uBounds.w) {
-    col = shadeBlob(p);
-  }
-  for (int i = 0; i < P; i++) {
-    if (uTetherOn[i] > 0.5) col = over(shadeTether(p, i), col);
-  }
-  outColor = col;
+  vec4 seg = uSeg[gl_InstanceID];
+  vec2 style = uStyle[gl_InstanceID];
+  vec2 ab = seg.zw - seg.xy;
+  float len = length(ab);
+  vec2 u = len > 1e-6 ? ab / len : vec2(1.0, 0.0);
+  vec2 v = vec2(-u.y, u.x);
+  float pad = style.x + 2.0 * uWorldPerPx;
+  vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1)) * 2.0 - 1.0;
+  vWorld = (seg.xy + seg.zw) * 0.5 + u * corner.x * (len * 0.5 + pad) + v * corner.y * pad;
+  vSeg = seg;
+  vStyle = style;
+  vColor = uColor[gl_InstanceID];
+  gl_Position = vec4((vWorld - uOffset) / (uWorldPerPx * uViewport) * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const SPRITE_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+
+uniform float uWorldPerPx;
+in vec2 vWorld;
+flat in vec4 vSeg;
+flat in vec2 vStyle;
+flat in vec3 vColor;
+out vec4 outColor;
+
+void main() {
+  vec2 pa = vWorld - vSeg.xy;
+  vec2 ab = vSeg.zw - vSeg.xy;
+  float len2 = dot(ab, ab);
+  float h = len2 > 1e-12 ? clamp(dot(pa, ab) / len2, 0.0, 1.0) : 0.0;
+  float d = length(pa - ab * h) - vStyle.x;
+  float alpha = 1.0 - smoothstep(-uWorldPerPx, uWorldPerPx, d);
+  if (vStyle.y > 0.0) alpha *= step(fract(h * sqrt(len2) / vStyle.y), 0.55);
+  outColor = vec4(vColor * alpha, alpha);
 }`;
 
 export type BlobFrame = {
@@ -200,26 +205,35 @@ export type View = {
   dpr: number;
 };
 
-const GLOW_MARGIN = 2.2;
+type Program = { program: WebGLProgram; u: Record<string, WebGLUniformLocation | null> };
 
-/** Draws the blob and grab tethers as signed distance fields in a single fragment pass. */
+/**
+ * Draws the blob as a mesh the vertex shader builds from the rim balls: a triangle fan filled
+ * through a nonzero-winding stencil (so folds that cross themselves still fill correctly), an
+ * outline ribbon, then the eyes and grab tethers as instanced capsules.
+ */
 export class BlobGl {
   private gl: WebGL2RenderingContext;
-  private program!: WebGLProgram;
-  private u!: Record<string, WebGLUniformLocation | null>;
-  private readonly tetherColors: Float32Array;
-  private readonly curve = new Float32Array(CURVE_POINTS * 2);
-  private readonly radii = new Float32Array(ANGLES * 2);
-  private readonly scratch = new Float32Array(ANGLES);
+  private blob!: Program;
+  private sprite!: Program;
+  private readonly tetherColors: number[][];
+  private readonly seg = new Float32Array(MAX_SPRITES * 4);
+  private readonly style = new Float32Array(MAX_SPRITES * 2);
+  private readonly color = new Float32Array(MAX_SPRITES * 3);
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
     playerColors: readonly string[],
   ) {
-    const gl = canvas.getContext("webgl2", { premultipliedAlpha: true, antialias: false, desynchronized: true });
+    const gl = canvas.getContext("webgl2", {
+      premultipliedAlpha: true,
+      antialias: false,
+      stencil: true,
+      desynchronized: true,
+    });
     if (!gl) throw new Error("WebGL2 is not available in this browser");
     this.gl = gl;
-    this.tetherColors = new Float32Array(playerColors.flatMap(hexToRgb));
+    this.tetherColors = playerColors.map(hexToRgb);
     this.init();
     canvas.addEventListener("webglcontextlost", (e) => e.preventDefault());
     canvas.addEventListener("webglcontextrestored", () => this.init());
@@ -227,25 +241,14 @@ export class BlobGl {
 
   private init(): void {
     const gl = this.gl;
-    const compile = (type: number, src: string) => {
-      const s = gl.createShader(type)!;
-      gl.shaderSource(s, src);
-      gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) ?? "shader error");
-      return s;
-    };
-    const program = gl.createProgram()!;
-    gl.attachShader(program, compile(gl.VERTEX_SHADER, VERTEX));
-    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FRAGMENT));
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) ?? "link error");
-    this.program = program;
-    const names = [
-      "uRadius", "uCenter", "uCore", "uLook", "uBounds", "uWorldPerPx", "uWorldPerCss", "uOffset",
-      "uTether", "uTetherOn", "uTetherColor",
-    ];
-    this.u = Object.fromEntries(names.map((n) => [n, gl.getUniformLocation(program, n)]));
+    this.blob = link(gl, BLOB_VERTEX, BLOB_FRAGMENT, [
+      "uRim", "uCenter", "uOrient", "uPass", "uOutline", "uOffset", "uWorldPerPx", "uViewport",
+    ]);
+    this.sprite = link(gl, SPRITE_VERTEX, SPRITE_FRAGMENT, [
+      "uSeg", "uStyle", "uColor", "uOffset", "uWorldPerPx", "uViewport",
+    ]);
     gl.bindVertexArray(gl.createVertexArray());
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   resize(cssW: number, cssH: number, dpr: number): void {
@@ -257,84 +260,109 @@ export class BlobGl {
     const gl = this.gl;
     if (gl.isContextLost()) return;
     const { rim } = frame;
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (let i = 0; i < rim.length; i += 2) {
-      minX = Math.min(minX, rim[i]);
-      maxX = Math.max(maxX, rim[i]);
-      minY = Math.min(minY, rim[i + 1]);
-      maxY = Math.max(maxY, rim[i + 1]);
-    }
-    const m = RIM_BALL_RADIUS + GLOW_MARGIN;
-
     const worldPerCss = 1 / view.scale;
     const worldPerPx = worldPerCss / view.dpr;
-    const cssH = this.canvas.height / view.dpr;
-    const tethers = new Float32Array(PLAYER_COUNT * 4);
-    const on = new Float32Array(PLAYER_COUNT);
+    const { width, height } = this.canvas;
+    const cssH = height / view.dpr;
+    // Device pixel (0,0) is bottom-left; world y points up like GL.
+    const ox = -view.ox * worldPerCss;
+    const oy = view.worldH - (cssH - view.oy) * worldPerCss;
+
+    gl.viewport(0, 0, width, height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clearStencil(0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+
+    const { u } = this.blob;
+    const { x: cx, y: cy, area } = centroid(rim);
+    gl.useProgram(this.blob.program);
+    gl.uniform2fv(u.uRim, rim);
+    gl.uniform2f(u.uCenter, cx, cy);
+    gl.uniform1f(u.uOrient, area >= 0 ? 1 : -1);
+    gl.uniform1f(u.uOutline, Math.max(0.02 + worldPerCss, 3.5 * AA_PX * worldPerPx));
+    gl.uniform2f(u.uOffset, ox, oy);
+    gl.uniform1f(u.uWorldPerPx, worldPerPx);
+    gl.uniform2f(u.uViewport, width, height);
+
+    // Nonzero winding: count fan coverage in the stencil, then shade where it's non-zero,
+    // zeroing as we go so overlapping fan triangles shade each pixel once.
+    gl.enable(gl.STENCIL_TEST);
+    gl.colorMask(false, false, false, false);
+    gl.stencilFunc(gl.ALWAYS, 0, 0xff);
+    gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, gl.INCR_WRAP);
+    gl.stencilOpSeparate(gl.BACK, gl.KEEP, gl.KEEP, gl.DECR_WRAP);
+    gl.uniform1i(u.uPass, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, SKIN_POINTS * 3);
+    gl.colorMask(true, true, true, true);
+    gl.stencilFunc(gl.NOTEQUAL, 0, 0xff);
+    gl.stencilOp(gl.KEEP, gl.KEEP, gl.ZERO);
+    gl.drawArrays(gl.TRIANGLES, 0, SKIN_POINTS * 3);
+    gl.disable(gl.STENCIL_TEST);
+
+    gl.enable(gl.BLEND);
+    gl.uniform1i(u.uPass, 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, (SKIN_POINTS + 1) * 2);
+
+    const count = this.fillSprites(frame, worldPerCss);
+    const s = this.sprite.u;
+    gl.useProgram(this.sprite.program);
+    gl.uniform4fv(s.uSeg, this.seg);
+    gl.uniform2fv(s.uStyle, this.style);
+    gl.uniform3fv(s.uColor, this.color);
+    gl.uniform2f(s.uOffset, ox, oy);
+    gl.uniform1f(s.uWorldPerPx, worldPerPx);
+    gl.uniform2f(s.uViewport, width, height);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+    gl.disable(gl.BLEND);
+  }
+
+  /** Eyes riding on the core, then each grab tether as a dashed line and a dot. */
+  private fillSprites(frame: BlobFrame, css: number): number {
+    let n = 0;
+    const add = (ax: number, ay: number, bx: number, by: number, radius: number, dash: number, rgb: number[]) => {
+      this.seg.set([ax, ay, bx, by], n * 4);
+      this.style.set([radius, dash], n * 2);
+      this.color.set(rgb, n * 3);
+      n++;
+    };
+    const { core, look } = frame;
+    for (const side of [-1, 1]) {
+      const ex = core.x + side * 0.32;
+      const ey = core.y + 0.2;
+      add(ex, ey, ex, ey, 0.18, 0, [1, 1, 1]);
+    }
+    for (const side of [-1, 1]) {
+      const px = core.x + side * 0.32 + look.x * 0.08;
+      const py = core.y + 0.2 + look.y * 0.08;
+      add(px, py, px, py, 0.09, 0, [0.08, 0.09, 0.12]);
+    }
     frame.tethers.forEach((t, i) => {
       if (!t) return;
-      tethers.set([t.hx, t.hy, t.bx, t.by], i * 4);
-      on[i] = 1;
+      add(t.hx, t.hy, t.bx, t.by, 1.5 * css, 11 * css, this.tetherColors[i]);
+      add(t.bx, t.by, t.bx, t.by, 5 * css, 0, this.tetherColors[i]);
     });
-
-    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    gl.useProgram(this.program);
-    const curve = catmullRomClosed(rim, this.curve);
-    const center = centroid(curve);
-    polarRadii(curve, center, this.radii);
-    capToPolygon(this.radii, polarRadii(rim, center, this.scratch));
-    dilateToSkin(this.radii, this.scratch);
-    this.radii.set(this.scratch);
-    blurCircular(this.radii);
-    gl.uniform4fv(this.u.uRadius, this.radii);
-    gl.uniform2f(this.u.uCenter, center.x, center.y);
-    gl.uniform2f(this.u.uCore, frame.core.x, frame.core.y);
-    gl.uniform2f(this.u.uLook, frame.look.x, frame.look.y);
-    gl.uniform4f(this.u.uBounds, minX - m, minY - m, maxX + m, maxY + m);
-    gl.uniform1f(this.u.uWorldPerPx, worldPerPx);
-    gl.uniform1f(this.u.uWorldPerCss, worldPerCss);
-    // Fragment (0,0) is the bottom-left device pixel; world y points up like GL.
-    gl.uniform2f(this.u.uOffset, -view.ox * worldPerCss, view.worldH - (cssH - view.oy) * worldPerCss);
-    gl.uniform4fv(this.u.uTether, tethers);
-    gl.uniform1fv(this.u.uTetherOn, on);
-    gl.uniform3fv(this.u.uTetherColor, this.tetherColors);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    return n;
   }
 }
 
-/** Uniform Catmull-Rom through a closed loop of points, CURVE_SUBDIVISIONS samples per span. */
-function catmullRomClosed(pts: Float32Array, out: Float32Array): Float32Array {
-  const n = pts.length / 2;
-  let o = 0;
-  for (let i = 0; i < n; i++) {
-    const i0 = ((i + n - 1) % n) * 2;
-    const i1 = i * 2;
-    const i2 = ((i + 1) % n) * 2;
-    const i3 = ((i + 2) % n) * 2;
-    for (let s = 0; s < CURVE_SUBDIVISIONS; s++) {
-      const t = s / CURVE_SUBDIVISIONS;
-      const t2 = t * t;
-      const t3 = t2 * t;
-      for (let k = 0; k < 2; k++) {
-        const p0 = pts[i0 + k];
-        const p1 = pts[i1 + k];
-        const p2 = pts[i2 + k];
-        const p3 = pts[i3 + k];
-        out[o + k] =
-          0.5 *
-          (2 * p1 + (p2 - p0) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (3 * p1 - p0 - 3 * p2 + p3) * t3);
-      }
-      o += 2;
-    }
-  }
-  return out;
+function link(gl: WebGL2RenderingContext, vs: string, fs: string, names: string[]): Program {
+  const compile = (type: number, src: string) => {
+    const s = gl.createShader(type)!;
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) ?? "shader error");
+    return s;
+  };
+  const program = gl.createProgram()!;
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) ?? "link error");
+  return { program, u: Object.fromEntries(names.map((n) => [n, gl.getUniformLocation(program, n)])) };
 }
 
-/** Area centroid of a closed polygon; the most star-friendly centre for a squished ring. */
-function centroid(pts: Float32Array): { x: number; y: number } {
+/** Area centroid of the rim polygon, and its signed area (positive when counter-clockwise). */
+function centroid(pts: Float32Array): { x: number; y: number; area: number } {
   const n = pts.length / 2;
   let a = 0;
   let cx = 0;
@@ -349,87 +377,7 @@ function centroid(pts: Float32Array): { x: number; y: number } {
     cx += (x0 + x1) * cross;
     cy += (y0 + y1) * cross;
   }
-  return { x: cx / (3 * a), y: cy / (3 * a) };
-}
-
-/**
- * Distance from `c` to the curve along each table direction. Where a ray crosses the curve
- * more than once (a fold), the farthest hit wins so the silhouette never gets holes.
- */
-function polarRadii(pts: Float32Array, c: { x: number; y: number }, out: Float32Array): Float32Array {
-  const n = pts.length / 2;
-  let fallback = 0;
-  for (let k = 0; k < ANGLES; k++) {
-    const ux = RAY_COS[k];
-    const uy = RAY_SIN[k];
-    let best = -1;
-    for (let i = 0; i < n; i++) {
-      const ax = pts[i * 2] - c.x;
-      const ay = pts[i * 2 + 1] - c.y;
-      const ex = pts[((i + 1) % n) * 2] - c.x - ax;
-      const ey = pts[((i + 1) % n) * 2 + 1] - c.y - ay;
-      const denom = ux * ey - uy * ex;
-      if (Math.abs(denom) < 1e-9) continue;
-      const s = (ax * uy - ay * ux) / denom;
-      if (s < 0 || s > 1) continue;
-      const t = (ax * ey - ay * ex) / denom;
-      if (t > best) best = t;
-    }
-    out[k] = best > 0 ? best : fallback;
-    if (best > 0) fallback = best;
-  }
-  return out;
-}
-
-/**
- * Catmull-Rom loops outward where the rim folds tightly. A smooth arc bulges past its chord
- * by well under this, so cap the curve's radius at the ball polygon's radius plus this.
- */
-const CURVE_BULGE = 0.02;
-function capToPolygon(curveR: Float32Array, polyR: Float32Array): void {
-  for (let k = 0; k < ANGLES; k++) curveR[k] = Math.min(curveR[k], polyR[k] + CURVE_BULGE);
-}
-
-/**
- * Grows the rim curve (through ball centres) out to the skin: along each ray, the farthest
- * point of any ball-sized disk centred on a table sample. Doing this here rather than
- * subtracting the ball radius in the shader keeps the skin exact at corners, where the
- * shader's linearised distance would otherwise extend steep edges into spikes.
- */
-const DILATE_SPAN = 12; // table samples; covers the ball's angular size down to R ≈ 0.27
-const DILATE_COS = Float32Array.from({ length: DILATE_SPAN * 2 + 1 }, (_, j) => Math.cos(((j - DILATE_SPAN) / ANGLES) * TAU));
-const DILATE_SIN = Float32Array.from({ length: DILATE_SPAN * 2 + 1 }, (_, j) => Math.sin(((j - DILATE_SPAN) / ANGLES) * TAU));
-function dilateToSkin(r: Float32Array, out: Float32Array): void {
-  const rr = RIM_BALL_RADIUS * RIM_BALL_RADIUS;
-  for (let k = 0; k < ANGLES; k++) {
-    let best = 0;
-    for (let j = 0; j < DILATE_COS.length; j++) {
-      const rj = r[(k + j - DILATE_SPAN + ANGLES) % ANGLES];
-      const side = rj * DILATE_SIN[j];
-      const h = rr - side * side;
-      if (h > 0) best = Math.max(best, rj * DILATE_COS[j] + Math.sqrt(h));
-    }
-    out[k] = best;
-  }
-}
-
-/** Gaussian over neighbouring angles, sigma in table samples; kernel spans ±3 sigma. */
-const NORMAL_BLUR_SIGMA = 3;
-const BLUR_KERNEL = (() => {
-  const half = NORMAL_BLUR_SIGMA * 3;
-  const w = Array.from({ length: half * 2 + 1 }, (_, i) => Math.exp(-((i - half) ** 2) / (2 * NORMAL_BLUR_SIGMA ** 2)));
-  const sum = w.reduce((a, b) => a + b, 0);
-  return w.map((v) => v / sum);
-})();
-
-/** Fills the second half of `table` with a circular blur of the first half. */
-function blurCircular(table: Float32Array): void {
-  const half = (BLUR_KERNEL.length - 1) / 2;
-  for (let k = 0; k < ANGLES; k++) {
-    let v = 0;
-    for (let j = 0; j < BLUR_KERNEL.length; j++) v += BLUR_KERNEL[j] * table[(k + j - half + ANGLES) % ANGLES];
-    table[ANGLES + k] = v;
-  }
+  return { x: cx / (3 * a), y: cy / (3 * a), area: a / 2 };
 }
 
 function hexToRgb(hex: string): number[] {
