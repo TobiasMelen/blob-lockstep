@@ -21,11 +21,14 @@ const SPOKE_STIFFNESS = 80;
 const SPOKE_DAMPING = 8;
 const BEND_STIFFNESS = 40;
 const BEND_DAMPING = 3;
+const CROSS_STIFFNESS = 20;
+const CROSS_DAMPING = 1;
 const HAND_STIFFNESS = 200;
 const HAND_DAMPING = 20;
 /** The hand never leads the grabbed body by more than this, so flicks can't tear the ring. */
 const MAX_REACH = 1.4;
 const PRESSURE = 25;
+const COLLAPSE_BOOST = 10;
 const RIM_RESTITUTION = 0.35;
 
 const GROUP_WORLD = 0x0001;
@@ -195,6 +198,18 @@ export class Sim {
         true,
       );
       bend.setContactsEnabled(false);
+
+      // Springs across the diameter hold the ring open without relying on the core, which
+      // can be yanked outside a folded ring where the spokes would keep it folded.
+      if (i < RIM_COUNT / 2) {
+        const across = world.createImpulseJoint(
+          RAPIER.JointData.spring(BLOB_RADIUS * 2, CROSS_STIFFNESS, CROSS_DAMPING, { x: 0, y: 0 }, { x: 0, y: 0 }),
+          a,
+          rim[i + RIM_COUNT / 2],
+          true,
+        );
+        across.setContactsEnabled(false);
+      }
     }
 
     const hands: number[] = [];
@@ -310,10 +325,11 @@ export class Sim {
       area += a.x * b.y - b.x * a.y;
     }
     area /= 2;
-    const deficit = Math.min(0.6, (this.layout.restArea - area) / this.layout.restArea);
+    const deficit = Math.min(1, (this.layout.restArea - area) / this.layout.restArea);
     if (deficit <= 0) return;
     const dt = this.world.timestep;
-    const magnitude = PRESSURE * deficit * dt;
+    // Grows faster than linear so a folded-flat blob (where the spokes are all happy) reinflates.
+    const magnitude = PRESSURE * (deficit + COLLAPSE_BOOST * deficit * deficit * deficit) * dt;
     for (let i = 0; i < n; i++) {
       const prev = pos[(i + n - 1) % n];
       const next = pos[(i + 1) % n];

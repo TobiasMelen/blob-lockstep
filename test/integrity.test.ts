@@ -50,8 +50,41 @@ function violentScript(seed: number, sim: Sim) {
   };
 }
 
+const at = (x: number, y: number): Input => ({ x: Math.round(x * 1000), y: Math.round(y * 1000), down: 1 });
+const idle: Input = { x: 0, y: 0, down: 0 };
+
 describe("Blob integrity", () => {
   beforeAll(() => initPhysics());
+
+  // Folding the blob flat (core yanked out through the rim, or top pulled through the bottom)
+  // used to leave it stuck as a banana at ~20% of its area.
+  for (const fold of ["core out", "top through bottom"] as const) {
+    it(`reinflates after being folded flat (${fold})`, () => {
+      const sim = Sim.create();
+      for (let t = 0; t < 180; t++) sim.step([idle, idle]);
+      const rest = measure(sim).area;
+      const pos = (h: number) => sim.world.getRigidBody(h).translation();
+      const { rim, core } = sim.layout;
+      const top = rim.reduce((b, h) => (pos(h).y > pos(b).y ? h : b));
+      const bottom = rim.reduce((b, h) => (pos(h).y < pos(b).y ? h : b));
+      let folded = Infinity;
+      for (let t = 0; t < 120; t++) {
+        // Each hand keeps reaching past its body, so the pull never lets up.
+        const k = Math.min(1, t / 20);
+        const pa = fold === "core out" ? pos(core) : pos(top);
+        const pb = pos(bottom);
+        const a = fold === "core out" ? at(pa.x - 4 * k, pa.y) : at(pa.x, pa.y - 4 * k);
+        const b = fold === "core out" ? idle : at(pb.x, pb.y + 4 * k);
+        sim.step([a, b]);
+        folded = Math.min(folded, measure(sim).area / rest);
+      }
+      for (let t = 0; t < 120; t++) sim.step([idle, idle]);
+      const recovered = measure(sim).area / rest;
+      sim.dispose();
+      expect(folded).toBeLessThan(0.7);
+      expect(recovered).toBeGreaterThan(0.9);
+    });
+  }
 
   for (const seed of [1, 2, 3]) {
     it(`survives violent two-player dragging (seed ${seed})`, () => {
