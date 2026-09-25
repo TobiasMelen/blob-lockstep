@@ -15,10 +15,10 @@ export const RIM_BALL_RADIUS = 0.13;
 const CORE_RADIUS = 0.35;
 export const GRAB_RADIUS = 1.0;
 // Rapier springs are acceleration-based: stiffness is (m/s²)/m regardless of mass, so the
-// feel comes from stiffness vs damping. Soft, lightly damped springs make the blob stretch
-// and wobble back to round in ~0.3 s.
-const SPOKE_STIFFNESS = 120;
-const SPOKE_DAMPING = 10;
+// feel comes from stiffness vs damping. Soft spokes let gravity slump the blob into a dome at
+// rest; pressure and the bend springs keep it from folding.
+const SPOKE_STIFFNESS = 80;
+const SPOKE_DAMPING = 8;
 const BEND_STIFFNESS = 40;
 const BEND_DAMPING = 3;
 const HAND_STIFFNESS = 200;
